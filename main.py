@@ -54,7 +54,7 @@ async def chat_endpoint(request: ChatRequest):
     # 1. Invoke Bedrock Agent
     agent_response_text = ""
     try:
-        logger.info(f"Invoking Agent: {request.agent_id} (Alias: {request.agent_alias_id})")
+        logger.info(f"Invoking Agent: {request.agent_id}")
         
         # Use the AgentCore runtime invocation API which expects a runtime ARN
         # and a payload (bytes). The API returns either a streaming event

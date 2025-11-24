@@ -150,7 +150,7 @@ async def chat_endpoint(request: ChatRequest):
             status_code = "error"
             error_msg = "Bedrock client not initialized"
             agent_response_text = "Service Error: Agent client unavailable."
-        agent_response_text = "I'm an ai agent, not a doctor."
+        
         # -------------------------------------------------------
         # 2. Write to DynamoDB (Resilient)
         # -------------------------------------------------------

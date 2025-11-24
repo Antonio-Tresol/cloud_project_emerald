@@ -16,7 +16,7 @@ app = FastAPI(title="Emerald Routing Service")
 
 # Environment Variables
 REGION = os.getenv("AWS_REGION", "us-east-1")
-DYNAMODB_TABLE_NAME = os.getenv("DYNAMODB_TABLE", "EmeraldGlobalStore")
+DYNAMODB_TABLE_NAME = os.getenv("DYNAMODB_TABLE")
 METRICS_LAMBDA_NAME = os.getenv("METRICS_LAMBDA_NAME")
 
 # --- AWS Clients ---
@@ -55,6 +55,8 @@ class ChatResponse(BaseModel):
     processing_time: float
     region: str
     status: str
+    # Added optional error field to return error details without crashing
+    error: str | None = None
 
 # --- Routes ---
 
@@ -71,114 +73,146 @@ async def chat_endpoint(request: ChatRequest):
     error_msg = None
     status_code = "success"
 
-    # -------------------------------------------------------
-    # 1. Invoke Bedrock Agent (Strands Server)
-    # -------------------------------------------------------
-    if bedrock_client:
-        try:
-            # MATCHING THE STRANDS AGENT SCHEMA:
-            # class InvocationRequest(BaseModel): prompt: str
-            payload_dict = {"prompt": request.message}
-            payload_bytes = json.dumps(payload_dict).encode('utf-8')
-
-            logger.info(f"Invoking Agent: {request.agent_id} with payload keys: {list(payload_dict.keys())}")
-            
-            # Using the specific invoke_agent_runtime from your snippet
-            response = bedrock_client.invoke_agent_runtime(
-                agentRuntimeArn=request.agent_id,
-                runtimeSessionId=request.session_id,
-                payload=payload_bytes
-            )
-                # Fallback
-            raw_output_string = str(response)
-
-            # --- Extract 'output' from Strands InvocationResponse ---
-            # The agent returns: {"output": "actual text"}
+    try:
+        # -------------------------------------------------------
+        # 1. Invoke Bedrock Agent (Strands Server)
+        # -------------------------------------------------------
+        if bedrock_client:
             try:
-                # Attempt to parse the raw string as JSON
-                response_json = json.loads(raw_output_string)
+                # MATCHING THE STRANDS AGENT SCHEMA:
+                # class InvocationRequest(BaseModel): prompt: str
+                payload_dict = {"prompt": request.message}
+                payload_bytes = json.dumps(payload_dict).encode('utf-8')
+
+                logger.info(f"Invoking Agent: {request.agent_id} with payload keys: {list(payload_dict.keys())}")
                 
-                # Check if it matches the Strands InvocationResponse schema
-                if isinstance(response_json, dict) and "output" in response_json:
-                    agent_response_text = response_json["output"]
-                else:
-                    # If parsing works but structure is different, use the whole JSON
-                    agent_response_text = raw_output_string
-            except json.JSONDecodeError:
-                # If it wasn't JSON (maybe plain text), use it directly
-                agent_response_text = raw_output_string
+                # Using the specific invoke_agent_runtime from your snippet
+                response = bedrock_client.invoke_agent_runtime(
+                    agentRuntimeArn=request.agent_id,
+                    runtimeSessionId=request.session_id,
+                    payload=payload_bytes
+                )
+                
+                # Fallback to string representation if parsing fails later
+                raw_output_string = str(response)
 
-            logger.info("Successfully received and parsed response from Agent")
+                # --- Extract 'output' from Strands InvocationResponse ---
+                # The agent returns a dictionary where one key is a StreamingBody.
+                try:
+                    # 1. Handle direct StreamingBody (rare but possible in some boto3 mocks)
+                    if hasattr(response, 'read'):
+                        raw_output_string = response.read().decode('utf-8')
+                    
+                    # 2. Handle standard boto3 dict response
+                    elif isinstance(response, dict):
+                        # Check specific keys known to contain the stream
+                        if 'body' in response and hasattr(response['body'], 'read'):
+                            raw_output_string = response['body'].read().decode('utf-8')
+                        elif 'response' in response and hasattr(response['response'], 'read'):
+                            # THIS IS THE KEY your log showed: 'response': <StreamingBody ...>
+                            raw_output_string = response['response'].read().decode('utf-8')
+                        elif 'Payload' in response and hasattr(response['Payload'], 'read'):
+                             # Common in Lambda/SageMaker
+                            raw_output_string = response['Payload'].read().decode('utf-8')
 
-        except ClientError as e:
-            logger.error(f"Bedrock ClientError: {e}")
-            agent_response_text = f"Error invoking agent: {e}"
-            error_msg = str(e)
+                    # 3. Try to parse whatever string we extracted as JSON
+                    try:
+                        response_json = json.loads(raw_output_string)
+                        # Check if it matches the Strands InvocationResponse schema
+                        if isinstance(response_json, dict) and "output" in response_json:
+                            agent_response_text = response_json["output"]
+                        else:
+                            agent_response_text = raw_output_string
+                    except json.JSONDecodeError:
+                        # If it's just a plain string (not JSON), use it as is
+                        agent_response_text = raw_output_string
+
+                except (TypeError, AttributeError, Exception) as e:
+                    # Fallback if stream reading fails
+                    logger.error(f"Stream reading error: {e}")
+                    agent_response_text = str(raw_output_string)
+
+                logger.info("Successfully received response from Agent")
+
+            except ClientError as e:
+                logger.error(f"Bedrock ClientError: {e}")
+                status_code = "error"
+                error_msg = str(e)
+                agent_response_text = f"Error invoking agent: {e}"
+                
+            except Exception as e:
+                logger.error(f"General Exception during Agent Invocation: {e}")
+                status_code = "error"
+                error_msg = str(e)
+                agent_response_text = "An unexpected error occurred during invocation."
+        else:
+            logger.error("Bedrock client not initialized")
             status_code = "error"
-        except Exception as e:
-            logger.error(f"General Exception during Agent Invocation: {e}")
-            agent_response_text = "An unexpected error occurred."
-            error_msg = str(e)
-            status_code = "error"
-    else:
-        logger.error("Bedrock client not initialized")
-        agent_response_text = "Service Error: Agent client unavailable."
+            error_msg = "Bedrock client not initialized"
+            agent_response_text = "Service Error: Agent client unavailable."
+
+        # -------------------------------------------------------
+        # 2. Write to DynamoDB (Resilient)
+        # -------------------------------------------------------
+        if table:
+            try:
+                item = {
+                    "PK": f"SESSION#{request.session_id}",
+                    "SK": f"MSG#{int(time.time()*1000)}",
+                    "UserMessage": request.message,
+                    "AgentResponse": agent_response_text,
+                    "Region": REGION,
+                    "AgentID": request.agent_id,
+                    "Timestamp": int(time.time()),
+                    "Status": status_code
+                }
+                if error_msg:
+                    item["Error"] = error_msg
+                
+                table.put_item(Item=item)
+            except Exception as e:
+                # Log only, do not crash
+                logger.error(f"DynamoDB Write Failed: {e}")
+
+        # -------------------------------------------------------
+        # 3. Invoke Metrics Lambda (Resilient & Async)
+        # -------------------------------------------------------
+        if lambda_client and METRICS_LAMBDA_NAME:
+            try:
+                metric_payload = {
+                    "type": "chat_metric",
+                    "session_id": request.session_id,
+                    "agent_id": request.agent_id,
+                    "latency": time.time() - start_time,
+                    "status": status_code,
+                    "timestamp": int(time.time())
+                }
+                
+                lambda_client.invoke(
+                    FunctionName=METRICS_LAMBDA_NAME,
+                    InvocationType='Event', 
+                    Payload=json.dumps(metric_payload)
+                )
+            except Exception as e:
+                logger.warning(f"Metrics Lambda Invocation Failed: {e}")
+
+    except Exception as e:
+        # Catch-all for any logic error outside the inner blocks (e.g. variable assignment failures)
+        logger.error(f"Critical Service Error: {e}")
         status_code = "error"
+        error_msg = str(e)
+        agent_response_text = "Critical Internal Error"
 
     # -------------------------------------------------------
-    # 2. Write to DynamoDB (Resilient)
-    # -------------------------------------------------------
-    if table:
-        try:
-            item = {
-                "PK": f"SESSION#{request.session_id}",
-                "SK": f"MSG#{int(time.time()*1000)}",
-                "UserMessage": request.message,
-                "AgentResponse": agent_response_text,
-                "Region": REGION,
-                "AgentID": request.agent_id,
-                "Timestamp": int(time.time()),
-                "Status": status_code
-            }
-            if error_msg:
-                item["Error"] = error_msg
-            
-            table.put_item(Item=item)
-        except Exception as e:
-            # Log only, do not crash
-            logger.error(f"DynamoDB Write Failed: {e}")
-
-    # -------------------------------------------------------
-    # 3. Invoke Metrics Lambda (Resilient & Async)
-    # -------------------------------------------------------
-    if lambda_client and METRICS_LAMBDA_NAME:
-        try:
-            metric_payload = {
-                "type": "chat_metric",
-                "session_id": request.session_id,
-                "agent_id": request.agent_id,
-                "latency": time.time() - start_time,
-                "status": status_code,
-                "timestamp": int(time.time())
-            }
-            
-            lambda_client.invoke(
-                FunctionName=METRICS_LAMBDA_NAME,
-                InvocationType='Event', 
-                Payload=json.dumps(metric_payload)
-            )
-        except Exception as e:
-            logger.warning(f"Metrics Lambda Invocation Failed: {e}")
-
-    # -------------------------------------------------------
-    # 4. Return Response
+    # 4. Return Response (Guaranteed)
     # -------------------------------------------------------
     return ChatResponse(
         session_id=request.session_id,
         response=agent_response_text,
         processing_time=time.time() - start_time,
         region=REGION,
-        status=status_code
+        status=status_code,
+        error=error_msg
     )
 
 if __name__ == "__main__":

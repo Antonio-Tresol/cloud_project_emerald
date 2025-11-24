@@ -18,6 +18,7 @@ app = FastAPI(title="Emerald Routing Service")
 REGION = os.getenv("AWS_REGION", "us-east-1")
 DYNAMODB_TABLE_NAME = os.getenv("DYNAMODB_TABLE")
 METRICS_LAMBDA_NAME = os.getenv("METRICS_LAMBDA_NAME")
+AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN")
 
 # --- AWS Clients ---
 # Resilient initialization: If a client fails to load, the app starts but logs the error.
@@ -29,12 +30,12 @@ except Exception as e:
     logger.error(f"Failed to initialize DynamoDB client: {e}")
     table = None
 
-try:
-    # Using the exact client name you insisted on
-    bedrock_client = boto3.client("bedrock-agentcore", region_name=REGION)
-except Exception as e:
-    logger.error(f"Failed to initialize Bedrock AgentCore client: {e}")
-    bedrock_client = None
+# try:
+#     # Using the exact client name you insisted on
+#     bedrock_client = boto3.client("bedrock-agentcore", region_name=REGION)
+# except Exception as e:
+#     logger.error(f"Failed to initialize Bedrock AgentCore client: {e}")
+#     bedrock_client = None
 
 try:
     lambda_client = boto3.client("lambda", region_name=REGION)
@@ -47,7 +48,6 @@ except Exception as e:
 class ChatRequest(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     message: str
-    agent_id: str
 
 class ChatResponse(BaseModel):
     session_id: str
@@ -77,80 +77,80 @@ async def chat_endpoint(request: ChatRequest):
         # -------------------------------------------------------
         # 1. Invoke Bedrock Agent (Strands Server)
         # -------------------------------------------------------
-        if bedrock_client:
-            try:
-                # MATCHING THE STRANDS AGENT SCHEMA:
-                # class InvocationRequest(BaseModel): prompt: str
-                payload_dict = {"prompt": request.message}
-                payload_bytes = json.dumps(payload_dict).encode('utf-8')
+        # if bedrock_client:
+        #     try:
+        #         # MATCHING THE STRANDS AGENT SCHEMA:
+        #         # class InvocationRequest(BaseModel): prompt: str
+        #         payload_dict = {"prompt": request.message}
+        #         payload_bytes = json.dumps(payload_dict).encode('utf-8')
 
-                logger.info(f"Invoking Agent: {request.agent_id} with payload keys: {list(payload_dict.keys())}")
+        #         logger.info(f"Invoking Agent: {request.agent_id} with payload keys: {list(payload_dict.keys())}")
                 
-                # Using the specific invoke_agent_runtime from your snippet
-                response = bedrock_client.invoke_agent_runtime(
-                    agentRuntimeArn=request.agent_id,
-                    runtimeSessionId=request.session_id,
-                    payload=payload_bytes
-                )
+        #         # Using the specific invoke_agent_runtime from your snippet
+        #         response = bedrock_client.invoke_agent_runtime(
+        #             agentRuntimeArn=AGENT_RUNTIME_ARN,
+        #             runtimeSessionId=request.session_id,
+        #             payload=payload_bytes
+        #         )
                 
-                # Fallback to string representation if parsing fails later
-                raw_output_string = str(response)
+        #         # Fallback to string representation if parsing fails later
+        #         raw_output_string = str(response)
 
-                # --- Extract 'output' from Strands InvocationResponse ---
-                # The agent returns a dictionary where one key is a StreamingBody.
-                try:
-                    # 1. Handle direct StreamingBody (rare but possible in some boto3 mocks)
-                    if hasattr(response, 'read'):
-                        raw_output_string = response.read().decode('utf-8')
+        #         # --- Extract 'output' from Strands InvocationResponse ---
+        #         # The agent returns a dictionary where one key is a StreamingBody.
+        #         try:
+        #             # 1. Handle direct StreamingBody (rare but possible in some boto3 mocks)
+        #             if hasattr(response, 'read'):
+        #                 raw_output_string = response.read().decode('utf-8')
                     
-                    # 2. Handle standard boto3 dict response
-                    elif isinstance(response, dict):
-                        # Check specific keys known to contain the stream
-                        if 'body' in response and hasattr(response['body'], 'read'):
-                            raw_output_string = response['body'].read().decode('utf-8')
-                        elif 'response' in response and hasattr(response['response'], 'read'):
-                            # THIS IS THE KEY your log showed: 'response': <StreamingBody ...>
-                            raw_output_string = response['response'].read().decode('utf-8')
-                        elif 'Payload' in response and hasattr(response['Payload'], 'read'):
-                             # Common in Lambda/SageMaker
-                            raw_output_string = response['Payload'].read().decode('utf-8')
+        #             # 2. Handle standard boto3 dict response
+        #             elif isinstance(response, dict):
+        #                 # Check specific keys known to contain the stream
+        #                 if 'body' in response and hasattr(response['body'], 'read'):
+        #                     raw_output_string = response['body'].read().decode('utf-8')
+        #                 elif 'response' in response and hasattr(response['response'], 'read'):
+        #                     # THIS IS THE KEY your log showed: 'response': <StreamingBody ...>
+        #                     raw_output_string = response['response'].read().decode('utf-8')
+        #                 elif 'Payload' in response and hasattr(response['Payload'], 'read'):
+        #                      # Common in Lambda/SageMaker
+        #                     raw_output_string = response['Payload'].read().decode('utf-8')
 
-                    # 3. Try to parse whatever string we extracted as JSON
-                    try:
-                        response_json = json.loads(raw_output_string)
-                        # Check if it matches the Strands InvocationResponse schema
-                        if isinstance(response_json, dict) and "output" in response_json:
-                            agent_response_text = response_json["output"]
-                        else:
-                            agent_response_text = raw_output_string
-                    except json.JSONDecodeError:
-                        # If it's just a plain string (not JSON), use it as is
-                        agent_response_text = raw_output_string
+        #             # 3. Try to parse whatever string we extracted as JSON
+        #             try:
+        #                 response_json = json.loads(raw_output_string)
+        #                 # Check if it matches the Strands InvocationResponse schema
+        #                 if isinstance(response_json, dict) and "output" in response_json:
+        #                     agent_response_text = response_json["output"]
+        #                 else:
+        #                     agent_response_text = raw_output_string
+        #             except json.JSONDecodeError:
+        #                 # If it's just a plain string (not JSON), use it as is
+        #                 agent_response_text = raw_output_string
 
-                except (TypeError, AttributeError, Exception) as e:
-                    # Fallback if stream reading fails
-                    logger.error(f"Stream reading error: {e}")
-                    agent_response_text = str(raw_output_string)
+        #         except (TypeError, AttributeError, Exception) as e:
+        #             # Fallback if stream reading fails
+        #             logger.error(f"Stream reading error: {e}")
+        #             agent_response_text = str(raw_output_string)
 
-                logger.info("Successfully received response from Agent")
+        #         logger.info("Successfully received response from Agent")
 
-            except ClientError as e:
-                logger.error(f"Bedrock ClientError: {e}")
-                status_code = "error"
-                error_msg = str(e)
-                agent_response_text = f"Error invoking agent: {e}"
+        #     except ClientError as e:
+        #         logger.error(f"Bedrock ClientError: {e}")
+        #         status_code = "error"
+        #         error_msg = str(e)
+        #         agent_response_text = f"Error invoking agent: {e}"
                 
-            except Exception as e:
-                logger.error(f"General Exception during Agent Invocation: {e}")
-                status_code = "error"
-                error_msg = str(e)
-                agent_response_text = "An unexpected error occurred during invocation."
-        else:
-            logger.error("Bedrock client not initialized")
-            status_code = "error"
-            error_msg = "Bedrock client not initialized"
-            agent_response_text = "Service Error: Agent client unavailable."
-
+        #     except Exception as e:
+        #         logger.error(f"General Exception during Agent Invocation: {e}")
+        #         status_code = "error"
+        #         error_msg = str(e)
+        #         agent_response_text = "An unexpected error occurred during invocation."
+        # else:
+        #     logger.error("Bedrock client not initialized")
+        #     status_code = "error"
+        #     error_msg = "Bedrock client not initialized"
+        #     agent_response_text = "Service Error: Agent client unavailable."
+        agent_response_text = "I'm an ai agent, not a doctor."
         # -------------------------------------------------------
         # 2. Write to DynamoDB (Resilient)
         # -------------------------------------------------------

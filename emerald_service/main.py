@@ -18,7 +18,6 @@ app = FastAPI(title="Emerald Routing Service")
 REGION = os.getenv("AWS_REGION", "us-east-1")
 DYNAMODB_TABLE_NAME = os.getenv("DYNAMODB_TABLE")
 METRICS_LAMBDA_NAME = os.getenv("METRICS_LAMBDA_NAME")
-AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN")
 
 # --- AWS Clients ---
 # Resilient initialization: If a client fails to load, the app starts but logs the error.
@@ -48,6 +47,7 @@ except Exception as e:
 class ChatRequest(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     message: str
+    agent_id: str
 
 class ChatResponse(BaseModel):
     session_id: str
@@ -88,7 +88,7 @@ async def chat_endpoint(request: ChatRequest):
                 
         #         # Using the specific invoke_agent_runtime from your snippet
         #         response = bedrock_client.invoke_agent_runtime(
-        #             agentRuntimeArn=AGENT_RUNTIME_ARN,
+        #             agentRuntimeArn=request.agent_id,
         #             runtimeSessionId=request.session_id,
         #             payload=payload_bytes
         #         )
